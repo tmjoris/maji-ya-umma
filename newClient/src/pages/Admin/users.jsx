@@ -1,6 +1,6 @@
 import { PlusCircle, Search } from "lucide-react"
 
-import { Button } from "../../components/ui/button"
+import { Button } from "../../Components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../../components/ui/card"
 import { Input } from "../../components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select"

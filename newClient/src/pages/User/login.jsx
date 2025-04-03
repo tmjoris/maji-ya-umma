@@ -2,7 +2,7 @@ import { useState } from "react"
 import { Link, useNavigate } from "react-router-dom"
 import { CreditCard, Droplet, History, LifeBuoy, User } from "lucide-react"
 
-import { Button } from "../../components/ui/button"
+import { Button } from "../../Components/ui/button"
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "../../components/ui/card"
 import { Input } from "../../components/ui/input"
 import { Label } from "../../components/ui/label"
