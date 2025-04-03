@@ -74,7 +74,7 @@ function BillsPage() {
   console.log("Request body:", paymentData);
 
     try {
-      const response = await fetch("http://localhost:10000/api/payment", {
+      const response = await fetch("https://maji-ya-umma.onrender.com/api/payment", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

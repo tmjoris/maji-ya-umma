@@ -28,7 +28,7 @@ function FeedbackPage() {
     }
 
     try {
-      const response = await fetch("http://localhost:10000/api/feedback", {
+      const response = await fetch("https://maji-ya-umma.onrender.com/api/feedback", {
         method: "POST",
         body: formData,
       });

@@ -20,7 +20,7 @@ function RequestConnectionPage() {
   useEffect(() => {
     const fetchUserProfile = async () => {
       try {
-        const response = await fetch(`http://localhost:10000/api/profile?email=${email}`);
+        const response = await fetch(`https://maji-ya-umma.onrender.com/api/profile?email=${email}`);
         const data = await response.json();
         setFormData({
           address: data.user.address,
@@ -45,7 +45,7 @@ function RequestConnectionPage() {
   const handleRequestConnection = async () => {
     setIsLoading(true);
     try {
-      const response = await fetch("http://localhost:10000/api/request-connection", {
+      const response = await fetch("https://maji-ya-umma.onrender.com/api/request-connection", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

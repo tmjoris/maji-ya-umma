@@ -26,7 +26,7 @@ function ProfilePage() {
     const fetchUserProfile = async () => {
       try {
         const email = localStorage.getItem("userEmail");
-        const response = await fetch(`http://localhost:10000/api/profile?email=${email}`);
+        const response = await fetch(`https://maji-ya-umma.onrender.com/api/profile?email=${email}`);
         const data = await response.json();
 
         if (response.ok) {
@@ -60,7 +60,7 @@ function ProfilePage() {
 
   const handleSaveChanges = async () => {
     try {
-      const response = await fetch("http://localhost:10000/api/update-profile", {
+      const response = await fetch("https://maji-ya-umma.onrender.com/api/update-profile", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(formData),
