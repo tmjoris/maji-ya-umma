@@ -2,8 +2,8 @@ import { useState } from "react"
 import { Link, useLocation } from "react-router-dom"
 import { BarChart3, CreditCard, FileText, LifeBuoy, LogOut, Menu, Settings, Users, X } from "lucide-react"
 
-import { Button } from "../components/ui/button"
-import { Sheet, SheetContent, SheetTrigger } from "../components/ui/sheet"
+import { Button } from "../Components/ui/button"
+import { Sheet, SheetContent, SheetTrigger } from "../Components/ui/sheet"
 import { Logo } from "./logo"
 
 export function AdminLayout({ children }) {

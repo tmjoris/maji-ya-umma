@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card"
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../Components/ui/card"
 
 export function UsageChart({ data, title = "Water Usage", description = "Monthly water consumption in litres" }) {
   const canvasRef = useRef(null)
