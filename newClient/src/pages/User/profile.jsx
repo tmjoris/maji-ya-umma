@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
 import { CustomerLayout } from "../../Components/customer-layout";
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "../../components/ui/card";
-import { Input } from "../../components/ui/input";
-import { Label } from "../../components/ui/label";
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "../../Components/ui/card";
+import { Input } from "../../Components/ui/input";
+import { Label } from "../../Components/ui/label";
 import { Button } from "../../Components/ui/button";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../components/ui/tabs";
-import { Switch } from "../../components/ui/switch";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../Components/ui/tabs";
+import { Switch } from "../../Components/ui/switch";
 
 function ProfilePage() {
   const [user, setUser] = useState(null);

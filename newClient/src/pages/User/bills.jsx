@@ -4,10 +4,10 @@ import { CreditCard, Smartphone, Building, Loader2 } from "lucide-react";
 import { toast, ToastContainer } from "react-toastify";
 import "react-toastify/dist/ReactToastify.css";
 import { Button } from "../../Components/ui/button";
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "../../components/ui/card";
-import { Input } from "../../components/ui/input";
-import { Label } from "../../components/ui/label";
-import { RadioGroup, RadioGroupItem } from "../../components/ui/radio-group";
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "../../Components/ui/card";
+import { Input } from "../../Components/ui/input";
+import { Label } from "../../Components/ui/label";
+import { RadioGroup, RadioGroupItem } from "../../Components/ui/radio-group";
 import { getUsageDataFromLocalStorage } from "./utils"; 
 import { CustomerLayout } from "../../Components/customer-layout";
 

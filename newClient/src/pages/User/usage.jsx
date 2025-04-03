@@ -1,8 +1,8 @@
 import { useState, useEffect } from "react";
 import { CustomerLayout } from "../../Components/customer-layout";
 import { UsageChart } from "../../Components/usage-chart";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../../components/ui/card";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../../Components/ui/card";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../Components/ui/select";
 import { Timestamp } from "firebase/firestore"; // Import Timestamp from Firebase
 
 function UsagePage() {

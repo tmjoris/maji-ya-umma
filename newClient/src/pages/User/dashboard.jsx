@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
 import { BarChart3, CreditCard, Droplet, LifeBuoy } from "lucide-react";
 import { Button } from "../../Components/ui/button";
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "../../components/ui/card";
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "../../Components/ui/card";
 import { CustomerLayout } from "../../Components/customer-layout";
 import { StatCard } from "../../Components/stat-card";
 import { UsageChart } from "../../Components/usage-chart";

@@ -1,9 +1,9 @@
 import { Search } from "lucide-react"
 
 import { Button } from "../../Components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../../components/ui/card"
-import { Input } from "../../components/ui/input"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select"
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../../Components/ui/card"
+import { Input } from "../../Components/ui/input"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../Components/ui/select"
 import { AdminLayout } from "../../Components/admin-layout"
 
 function TicketsPage() {

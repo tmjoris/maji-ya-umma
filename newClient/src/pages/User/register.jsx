@@ -2,9 +2,9 @@ import { useState } from "react"
 import { Link, useNavigate } from "react-router-dom"
 import { Droplet, Shield, CheckCircle } from "lucide-react"
 import { Button } from "../../Components/ui/button"
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "../../components/ui/card"
-import { Input } from "../../components/ui/input"
-import { Label } from "../../components/ui/label"
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "../../Components/ui/card"
+import { Input } from "../../Components/ui/input"
+import { Label } from "../../Components/ui/label"
 
 function RegisterPage() {
   const navigate = useNavigate();

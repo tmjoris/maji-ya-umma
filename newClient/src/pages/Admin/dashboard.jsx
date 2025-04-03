@@ -2,7 +2,7 @@ import { Link } from "react-router-dom"
 import { CreditCard, Droplet, LifeBuoy, Users } from "lucide-react"
 
 import { Button } from "../../Components/ui/button"
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "../../components/ui/card"
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "../../Components/ui/card"
 import { AdminLayout } from "../../Components/admin-layout"
 import { StatCard } from "../../Components/stat-card"
 import { UsageChart } from "../../Components/usage-chart"
