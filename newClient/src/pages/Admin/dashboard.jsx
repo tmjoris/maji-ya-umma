@@ -11,7 +11,7 @@ function AdminDashboard() {
   // Sample data for the usage chart
   const usageData = [
     { month: "Jan", usage: 12500 },
-    { month: "Feb", usage: 15000 },
+    { month: "Feb", usage: 110000 },
     { month: "Mar", usage: 18000 },
     { month: "Apr", usage: 14000 },
     { month: "May", usage: 13000 },

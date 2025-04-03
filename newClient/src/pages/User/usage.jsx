@@ -19,7 +19,7 @@ function UsagePage() {
   useEffect(() => {
     const fetchUserProfile = async () => {
       try {
-        const response = await fetch(`http://localhost:5000/api/profile?email=${email}`);
+        const response = await fetch(`http://localhost:10000/api/profile?email=${email}`);
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`);
         }
