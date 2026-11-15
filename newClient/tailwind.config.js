@@ -1,5 +1,5 @@
 // tailwind.config.js
-module.exports = {
+export default {
 	content: [
 	  "./src/**/*.{html,js,jsx,ts,tsx}",
 	],
