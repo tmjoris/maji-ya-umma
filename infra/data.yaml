@@ -1,0 +1,112 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Maji ya Umma - always-on resources: the DynamoDB table (provisioned inside the
+  always-free 25 RCU / 25 WCU), the backend's IAM user, and the role that lets
+  the on-demand Amazon MQ stack delete itself on schedule.
+
+Parameters:
+  TableName:
+    Type: String
+    Default: maji-ya-umma
+  MqStackName:
+    Type: String
+    Default: maji-ya-umma-mq
+    Description: Name of the on-demand broker stack (infra/mq.yaml) the auto-delete role may delete.
+
+Resources:
+  # Single-table design; mirrors Backend/data/schema.js.
+  # 8 RCU/WCU for the table and each index = 24 + 24, inside the free 25 + 25.
+  Table:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PROVISIONED
+      DeletionProtectionEnabled: true
+      ProvisionedThroughput: { ReadCapacityUnits: 8, WriteCapacityUnits: 8 }
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: gsi1pk, AttributeType: S }
+        - { AttributeName: gsi1sk, AttributeType: S }
+        - { AttributeName: gsi2pk, AttributeType: S }
+        - { AttributeName: gsi2sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema:
+            - { AttributeName: gsi1pk, KeyType: HASH }
+            - { AttributeName: gsi1sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+          ProvisionedThroughput: { ReadCapacityUnits: 8, WriteCapacityUnits: 8 }
+        - IndexName: gsi2
+          KeySchema:
+            - { AttributeName: gsi2pk, KeyType: HASH }
+            - { AttributeName: gsi2sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+          ProvisionedThroughput: { ReadCapacityUnits: 8, WriteCapacityUnits: 8 }
+
+  # The API and workers use this identity, not your account's root user.
+  # It can read and write this one table, nothing else.
+  BackendUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "${TableName}-backend"
+      Policies:
+        - PolicyName: dynamodb-table-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:ConditionCheckItem
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !GetAtt Table.Arn
+                  - !Sub "${Table.Arn}/index/*"
+
+  # Assumed by EventBridge Scheduler to delete the broker stack when its time
+  # is up. It can delete that one stack and the resources in it, nothing more.
+  MqAutoDeleteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${MqStackName}-auto-delete"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: delete-mq-stack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [cloudformation:DeleteStack, cloudformation:DescribeStacks]
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${MqStackName}/*"
+              - Effect: Allow
+                Action: [mq:DeleteBroker, mq:DescribeBroker]
+                Resource: !Sub "arn:aws:mq:${AWS::Region}:${AWS::AccountId}:broker:*"
+              - Effect: Allow
+                Action: [scheduler:DeleteSchedule, scheduler:GetSchedule]
+                Resource: !Sub "arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/${MqStackName}-*"
+
+Outputs:
+  TableName:
+    Value: !Ref Table
+  BackendUserName:
+    Value: !Ref BackendUser
+  MqAutoDeleteRoleArn:
+    Value: !GetAtt MqAutoDeleteRole.Arn

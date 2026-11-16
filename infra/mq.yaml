@@ -1,0 +1,70 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Maji ya Umma - on-demand Amazon MQ (RabbitMQ) broker. Billed per hour while
+  it exists (mq.m7g.medium, about $0.15/h in eu-west-1), so it is created for a
+  session and deleted afterwards. A one-time schedule deletes this stack at
+  AutoDeleteAt even if nobody remembers to. Use infra/mq.sh, not this file directly.
+
+Parameters:
+  BrokerName:
+    Type: String
+    Default: maji-ya-umma
+  InstanceType:
+    Type: String
+    Default: mq.m7g.medium
+    Description: Smallest RabbitMQ size Amazon MQ offers (mq.t3.micro is ActiveMQ-only).
+  EngineVersion:
+    Type: String
+    Default: "4.2"
+  Username:
+    Type: String
+    MinLength: 2
+  Password:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+  AutoDeleteAt:
+    Type: String
+    Description: UTC time to delete this stack, as yyyy-mm-ddThh:mm:ss
+    AllowedPattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}$"
+  AutoDeleteRoleArn:
+    Type: String
+    Description: MqAutoDeleteRoleArn output of the data stack (infra/data.yaml)
+
+Resources:
+  Broker:
+    Type: AWS::AmazonMQ::Broker
+    Properties:
+      BrokerName: !Ref BrokerName
+      EngineType: RABBITMQ
+      EngineVersion: !Ref EngineVersion
+      HostInstanceType: !Ref InstanceType
+      DeploymentMode: SINGLE_INSTANCE
+      # Reachable from Render and laptops; TLS only (amqps://, port 5671),
+      # authenticated by the broker user below.
+      PubliclyAccessible: true
+      AutoMinorVersionUpgrade: true
+      Logs: { General: false }
+      Users:
+        - Username: !Ref Username
+          Password: !Ref Password
+
+  # Safety net against forgetting `mq.sh down`: deletes this whole stack.
+  AutoDelete:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-auto-delete"
+      Description: Deletes the on-demand Amazon MQ broker stack
+      ScheduleExpression: !Sub "at(${AutoDeleteAt})"
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:cloudformation:deleteStack
+        RoleArn: !Ref AutoDeleteRoleArn
+        Input: !Sub '{"StackName": "${AWS::StackName}"}'
+
+Outputs:
+  BrokerId:
+    Value: !Ref Broker
+  AutoDeleteAt:
+    Value: !Ref AutoDeleteAt
