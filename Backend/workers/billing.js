@@ -1,4 +1,4 @@
-import { db, collections, FieldValue, Timestamp } from "../firebase.js";
+import { K, get, getMany, query, update, tx, transact, retryOnConflict, versionCondition, now } from "../data/db.js";
 import { EVENTS } from "../mq/config.js";
 import { PermanentError } from "../mq/errors.js";
 import { publishEvent } from "../mq/publisher.js";
@@ -18,26 +18,23 @@ export async function startBillingRun(event) {
   if (period >= periodOf(new Date())) throw new PermanentError(`period ${period} has not ended yet`);
 
   const periodEnd = periodStart(shiftPeriod(period, 1)).getTime();
-  const meters = await collections.meters().where("status", "==", "active").get();
-  const eligible = meters.docs.filter((d) => toMillis(d.data().installedAt) < periodEnd);
+  const eligible = await query({
+    index: "gsi2",
+    pk: "METERS",
+    filter: (m) => m.status === "active" && toMillis(m.installedAt) < periodEnd,
+  });
 
-  await collections.billingRuns().doc(period).set(
-    {
-      period,
-      metersQueued: eligible.length,
-      lastRequestedBy: requestedBy ?? null,
-      lastRequestedAt: FieldValue.serverTimestamp(),
-    },
-    { merge: true }
-  );
+  await update(K.billingRun(period), {
+    set: { entity: "billingRun", period, metersQueued: eligible.length, lastRequestedBy: requestedBy ?? null, lastRequestedAt: now() },
+  });
 
   for (let i = 0; i < eligible.length; i += 100) {
     await Promise.all(
-      eligible.slice(i, i + 100).map((d) =>
+      eligible.slice(i, i + 100).map((m) =>
         publishEvent(
           EVENTS.BILL_GENERATE_REQUESTED,
-          { period, meterNumber: d.id, uid: d.data().uid },
-          { id: `bill:${period}:${d.id}` }
+          { period, meterNumber: m.meterNumber, uid: m.uid },
+          { id: `bill:${period}:${m.meterNumber}` }
         )
       )
     );
@@ -46,58 +43,74 @@ export async function startBillingRun(event) {
 }
 
 // billing.generate — one bill per meter per period, id <period>_<meter>.
+// The bill and the customer's balance change are written together, on
+// condition that the customer hasn't changed since read (a payment may be
+// settling at the same moment); otherwise it retries.
 export async function generateBill(event) {
   const { period, meterNumber, uid } = event.data;
-  const billRef = collections.bills().doc(`${period}_${meterNumber}`);
-  const usageRef = collections.usage().doc(`${meterNumber}_${period}`);
-  const userRef = collections.users().doc(uid);
+  const billId = `${period}_${meterNumber}`;
 
-  const bill = await db.runTransaction(async (tx) => {
-    const [billSnap, usageSnap, userSnap] = await tx.getAll(billRef, usageRef, userRef);
-    if (billSnap.exists) return billSnap.data();
-    if (!userSnap.exists) throw new PermanentError(`meter ${meterNumber} belongs to missing user ${uid}`);
+  const bill = await retryOnConflict(async () => {
+    const existing = await get(K.bill(billId));
+    if (existing) return existing;
 
-    const profile = userSnap.data();
-    const litres = usageSnap.exists ? usageSnap.data().consumptionLitres ?? 0 : 0;
+    const [usage, user] = await getMany([K.usage(meterNumber, period), K.user(uid)]);
+    if (!user) throw new PermanentError(`meter ${meterNumber} belongs to missing user ${uid}`);
+
+    const litres = usage?.consumptionLitres ?? 0;
     const charges = computeCharges(litres);
 
     // Existing credit (negative balance) is applied to the new bill.
-    const credit = Math.max(0, -(profile.balance ?? 0));
+    const credit = Math.max(0, -(user.balance ?? 0));
     const applied = Math.min(credit, charges.total);
     const dueDate = new Date(periodStart(shiftPeriod(period, 1)).getTime() + BILL_DUE_DAYS * 86_400_000);
+    const status = applied >= charges.total ? "paid" : applied > 0 ? "partially_paid" : "unpaid";
 
     const data = {
+      ...K.bill(billId),
+      entity: "bill",
+      gsi1pk: `USER#${uid}`,
+      gsi1sk: `BILL#${period}#${meterNumber}`,
+      gsi2pk: `BILLS#${period}`,
+      gsi2sk: meterNumber,
+      id: billId,
       uid,
       meterNumber,
-      accountNumber: profile.accountNumber ?? null,
-      customerName: fullName(profile),
+      accountNumber: user.accountNumber ?? null,
+      customerName: fullName(user),
       period,
       consumptionLitres: litres,
       tariff: charges.tariff,
       lines: charges.lines,
       amountDue: charges.total,
       amountPaid: applied,
-      status: applied >= charges.total ? "paid" : applied > 0 ? "partially_paid" : "unpaid",
-      issuedAt: Timestamp.now(),
-      dueDate: Timestamp.fromDate(dueDate),
+      status,
+      issuedAt: now(),
+      dueDate: dueDate.toISOString(),
     };
-    tx.create(billRef, data);
-    tx.update(userRef, { balance: FieldValue.increment(charges.total) });
+    await transact([
+      tx.put(data),
+      tx.update(K.user(uid), {
+        add: { balance: charges.total, version: 1 },
+        ...(status !== "paid" ? { append: { openBills: [billId] } } : {}),
+        ...versionCondition(user),
+      }),
+    ]);
     return data;
   });
 
   await publishEvent(
     EVENTS.BILL_ISSUED,
     {
-      billId: billRef.id,
+      billId,
       uid,
       period,
       meterNumber,
       consumptionLitres: bill.consumptionLitres,
       amountDue: bill.amountDue,
       amountOutstanding: bill.amountDue - bill.amountPaid,
-      dueDate: bill.dueDate.toDate().toISOString(),
+      dueDate: bill.dueDate,
     },
-    { id: `${billRef.id}:issued` }
+    { id: `${billId}:issued` }
   );
 }

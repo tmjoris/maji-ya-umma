@@ -1,5 +1,5 @@
 import "../env.js";
-import { collections, FieldValue } from "../firebase.js";
+import { K, get, put, now } from "../data/db.js";
 import { EVENTS } from "../mq/config.js";
 import { publishEvent } from "../mq/publisher.js";
 import { sendSms, sendEmail } from "../services/notify.js";
@@ -91,7 +91,7 @@ export async function dispatchNotification(event) {
   if (!template) return;
 
   const uid = event.data.uid;
-  const user = uid ? (await collections.users().doc(uid).get()).data() : null;
+  const user = uid ? await get(K.user(uid)) : null;
 
   const messages = template(event.data, user).filter(Boolean);
   await Promise.all(
@@ -108,12 +108,17 @@ export async function dispatchNotification(event) {
 // Each send is recorded under the notification's id; a redelivered message
 // whose notification was already sent is skipped instead of sent twice.
 async function deliverOnce(event, send) {
-  const ref = collections.notifications().doc(event.id);
-  const existing = await ref.get();
-  if (existing.exists && existing.data().status === "sent") return;
+  const existing = await get(K.notification(event.id));
+  if (existing?.status === "sent") return;
 
   const result = await send();
-  await ref.set({
+  const sentAt = now();
+  await put({
+    ...K.notification(event.id),
+    entity: "notification",
+    // Listed per customer (gsi1) when the notification belongs to one.
+    ...(event.data.uid ? { gsi1pk: `USER#${event.data.uid}`, gsi1sk: `NOTIFICATION#${sentAt}` } : {}),
+    id: event.id,
     channel: event.data.channel,
     to: event.data.to,
     subject: event.data.subject ?? null,
@@ -123,7 +128,7 @@ async function deliverOnce(event, send) {
     status: "sent",
     provider: result.provider,
     providerMessageId: result.messageId ?? null,
-    sentAt: FieldValue.serverTimestamp(),
+    sentAt,
   });
 }
 

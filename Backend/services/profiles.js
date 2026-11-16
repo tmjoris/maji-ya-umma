@@ -1,38 +1,28 @@
-import { db, collections } from "../firebase.js";
-import { generateAccountNumber, serialize } from "../lib/util.js";
+import { K, get, clean } from "../data/db.js";
+import { serialize } from "../lib/util.js";
 
 export const ROLES = { CUSTOMER: "user", ADMIN: "admin" };
 
-// Profiles live at user/{uid}. Accounts created before the auth rework were
-// stored under random ids; the first time such a user signs in, their profile
-// is moved to user/{uid} (same data, plus the new account fields).
-export async function loadProfile({ uid, email }) {
-  const ref = collections.users().doc(uid);
-  const snap = await ref.get();
-  if (snap.exists) return { id: uid, ...snap.data() };
-  if (!email) return null;
+// Profiles are stored at USER#<uid>. (Profiles from the Firestore era are
+// copied over by scripts/migrate-from-firestore.js.)
+export async function loadProfile({ uid }) {
+  const item = await get(K.user(uid));
+  return item ? { id: uid, ...clean(item) } : null;
+}
 
-  const legacy = await collections.users().where("email", "==", email).limit(1).get();
-  if (legacy.empty) return null;
-  const legacyRef = legacy.docs[0].ref;
-
-  return db.runTransaction(async (tx) => {
-    const [current, old] = await tx.getAll(ref, legacyRef);
-    if (current.exists) return { id: uid, ...current.data() };
-    if (!old.exists) return null;
-
-    const data = {
-      ...old.data(),
-      uid,
-      userRole: old.data().userRole || ROLES.CUSTOMER,
-      accountNumber: old.data().accountNumber || generateAccountNumber(),
-      balance: old.data().balance ?? 0,
-      meterNumbers: old.data().meterNumbers ?? [],
-    };
-    tx.set(ref, data);
-    tx.delete(legacyRef);
-    return { id: uid, ...data };
-  });
+// A new profile item, with the index keys used to list all users.
+export function newUserItem(profile) {
+  return {
+    ...K.user(profile.uid),
+    entity: "user",
+    gsi2pk: "USERS",
+    gsi2sk: profile.uid,
+    version: 0,
+    openBills: [],
+    balance: 0,
+    meterNumbers: [],
+    ...profile,
+  };
 }
 
 // What a customer may see about themselves / what admins see in lists.

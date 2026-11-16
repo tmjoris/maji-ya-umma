@@ -1,15 +1,14 @@
 import express from "express";
-import { AggregateField } from "firebase-admin/firestore";
-import { db, collections, FieldValue, Timestamp } from "../firebase.js";
+import { K, get, getMany, update, query, tx, transact, cancellationCodes, clean, now } from "../data/db.js";
 import { EVENTS } from "../mq/config.js";
 import { publishEvent, queueStats } from "../mq/publisher.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { publicProfile, fullName, ROLES } from "../services/profiles.js";
 import { TARIFF } from "../services/tariff.js";
+import { sendAttachment } from "../lib/filetype.js";
 import {
   asyncHandler,
   HttpError,
-  docToJSON,
   toMillis,
   isValidPeriod,
   periodOf,
@@ -24,7 +23,18 @@ const router = express.Router();
 router.use(requireAuth, requireAdmin);
 
 const LIST_LIMIT = 500;
-const byNewest = (field) => (a, b) => toMillis(b[field]) - toMillis(a[field]);
+
+// System-wide lists come from the gsi2 index (see data/schema.js).
+const all = async (pk, opts = {}) => (await query({ index: "gsi2", pk, ...opts })).map(clean);
+const billsFor = (period) => all(`BILLS#${period}`);
+const isConditionFailure = (err) => err?.name === "ConditionalCheckFailedException";
+
+const withBillState = (b, nowMs = Date.now()) => ({
+  ...b,
+  label: periodLabel(b.period),
+  outstanding: b.amountDue - b.amountPaid,
+  overdue: b.status !== "paid" && toMillis(b.dueDate) < nowMs,
+});
 
 // Admin actions below are synchronous (they validate against current state and
 // the admin wants the answer now); the resulting domain event is published
@@ -40,57 +50,50 @@ router.get(
   asyncHandler(async (req, res) => {
     const current = periodOf();
     const lastPeriod = shiftPeriod(current, -1);
-    const monthStart = Timestamp.fromDate(periodStart(current));
     const chartPeriods = recentPeriods(6);
+    const billPeriods = recentPeriods(13).slice(0, -1); // the last 12 ended months
 
-    const count = (q) => q.count().get().then((s) => s.data().count);
-    const [customers, activeMeters, openTickets, pendingConnections, revenueAgg, monthPayments, usageDocs, lastBills, openBills] =
-      await Promise.all([
-        count(collections.users().where("userRole", "==", ROLES.CUSTOMER)),
-        count(collections.meters().where("status", "==", "active")),
-        count(collections.tickets().where("status", "in", ["open", "in_progress"])),
-        count(collections.connectionRequests().where("status", "==", "pending")),
-        collections.payments()
-          .where("completedAt", ">=", monthStart)
-          .aggregate({ total: AggregateField.sum("amountPaid"), count: AggregateField.count() })
-          .get(),
-        collections.payments().where("createdAt", ">=", monthStart).select("status").get(),
-        db.getAll(...chartPeriods.map((p) => collections.usageTotals().doc(p))),
-        collections.bills()
-          .where("period", "==", lastPeriod)
-          .aggregate({ count: AggregateField.count(), billed: AggregateField.sum("amountDue"), collected: AggregateField.sum("amountPaid") })
-          .get(),
-        collections.bills().where("status", "in", ["unpaid", "partially_paid"]).select("dueDate", "amountDue", "amountPaid").get(),
-      ]);
+    const [users, meters, tickets, requests, monthPayments, totals, lastBills, recentBills] = await Promise.all([
+      all("USERS"),
+      all("METERS"),
+      all("TICKETS"),
+      all("CONNREQS"),
+      all("PAYMENTS", { from: periodStart(current).toISOString() }),
+      getMany(chartPeriods.map((p) => K.usageTotal(p))),
+      billsFor(lastPeriod),
+      Promise.all(billPeriods.map(billsFor)).then((lists) => lists.flat()),
+    ]);
 
-    const settled = monthPayments.docs.map((d) => d.data().status).filter((s) => s === "completed" || s === "failed");
-    const now = Date.now();
-    const overdue = openBills.docs.filter((d) => toMillis(d.data().dueDate) < now);
+    const completed = monthPayments.filter((p) => p.status === "completed");
+    const settled = monthPayments.filter((p) => p.status === "completed" || p.status === "failed");
+    const nowMs = Date.now();
+    const open = recentBills.filter((b) => b.status !== "paid");
+    const overdue = open.filter((b) => toMillis(b.dueDate) < nowMs);
 
     res.json({
       period: current,
-      customers,
-      activeMeters,
-      openTickets,
-      pendingConnections,
-      revenueThisMonth: revenueAgg.data().total ?? 0,
-      paymentsThisMonth: revenueAgg.data().count,
-      paymentSuccessRate: settled.length ? settled.filter((s) => s === "completed").length / settled.length : null,
-      usage: usageDocs.map((d, i) => ({
+      customers: users.filter((u) => u.userRole === ROLES.CUSTOMER).length,
+      activeMeters: meters.filter((m) => m.status === "active").length,
+      openTickets: tickets.filter((t) => t.status === "open" || t.status === "in_progress").length,
+      pendingConnections: requests.filter((r) => r.status === "pending").length,
+      revenueThisMonth: completed.reduce((s, p) => s + (p.amountPaid ?? 0), 0),
+      paymentsThisMonth: completed.length,
+      paymentSuccessRate: settled.length ? completed.length / settled.length : null,
+      usage: totals.map((t, i) => ({
         period: chartPeriods[i],
         label: periodLabel(chartPeriods[i]),
-        consumptionLitres: d.exists ? d.data().consumptionLitres ?? 0 : 0,
+        consumptionLitres: t?.consumptionLitres ?? 0,
       })),
       lastPeriodBills: {
         period: lastPeriod,
         label: periodLabel(lastPeriod),
-        count: lastBills.data().count,
-        billed: lastBills.data().billed ?? 0,
-        collected: lastBills.data().collected ?? 0,
+        count: lastBills.length,
+        billed: lastBills.reduce((s, b) => s + b.amountDue, 0),
+        collected: lastBills.reduce((s, b) => s + b.amountPaid, 0),
       },
-      openBills: openBills.size,
+      openBills: open.length,
       overdueBills: overdue.length,
-      overdueAmount: overdue.reduce((s, d) => s + d.data().amountDue - d.data().amountPaid, 0),
+      overdueAmount: overdue.reduce((s, b) => s + b.amountDue - b.amountPaid, 0),
     });
   })
 );
@@ -104,21 +107,20 @@ router.get(
 
 // ---------- people ----------
 
+const byName = (a, b) => fullName(a).localeCompare(fullName(b));
+
 router.get(
   "/customers",
   asyncHandler(async (req, res) => {
-    const snap = await collections.users().where("userRole", "==", ROLES.CUSTOMER).limit(LIST_LIMIT).get();
-    const customers = snap.docs.map((d) => publicProfile({ id: d.id, ...d.data() }));
-    res.json({ customers: customers.sort((a, b) => fullName(a).localeCompare(fullName(b))) });
+    const users = await all("USERS");
+    res.json({ customers: users.filter((u) => u.userRole === ROLES.CUSTOMER).map(publicProfile).sort(byName) });
   })
 );
 
 router.get(
   "/users",
   asyncHandler(async (req, res) => {
-    const snap = await collections.users().limit(LIST_LIMIT).get();
-    const users = snap.docs.map((d) => publicProfile({ id: d.id, ...d.data() }));
-    res.json({ users: users.sort((a, b) => fullName(a).localeCompare(fullName(b))) });
+    res.json({ users: (await all("USERS")).map(publicProfile).sort(byName) });
   })
 );
 
@@ -128,9 +130,15 @@ router.patch(
     const role = req.body?.role;
     if (![ROLES.ADMIN, ROLES.CUSTOMER].includes(role)) throw new HttpError(400, "role must be admin or user");
     if (req.params.uid === req.user.uid) throw new HttpError(400, "You can't change your own role");
-    const ref = collections.users().doc(req.params.uid);
-    if (!(await ref.get()).exists) throw new HttpError(404, "User not found");
-    await ref.update({ userRole: role, roleChangedBy: req.user.uid, roleChangedAt: FieldValue.serverTimestamp() });
+    try {
+      await update(K.user(req.params.uid), {
+        set: { userRole: role, roleChangedBy: req.user.uid, roleChangedAt: now() },
+        condition: "attribute_exists(pk)",
+      });
+    } catch (err) {
+      if (isConditionFailure(err)) throw new HttpError(404, "User not found");
+      throw err;
+    }
     res.json({ message: `Role updated to ${role}` });
   })
 );
@@ -138,8 +146,10 @@ router.patch(
 router.get(
   "/meters",
   asyncHandler(async (req, res) => {
-    const q = req.query.uid ? collections.meters().where("uid", "==", String(req.query.uid)) : collections.meters().limit(LIST_LIMIT);
-    res.json({ meters: (await q.get()).docs.map(docToJSON) });
+    const meters = req.query.uid
+      ? (await query({ index: "gsi1", pk: `USER#${req.query.uid}`, prefix: "METER#" })).map(clean)
+      : await all("METERS", { limit: LIST_LIMIT });
+    res.json({ meters });
   })
 );
 
@@ -157,16 +167,14 @@ router.get(
   asyncHandler(async (req, res) => {
     const period = req.query.period;
     if (period && !isValidPeriod(period)) throw new HttpError(400, "period must be YYYY-MM");
-    const q = period
-      ? collections.bills().where("period", "==", period).limit(LIST_LIMIT)
-      : collections.bills().orderBy("issuedAt", "desc").limit(LIST_LIMIT);
-    const now = Date.now();
-    let bills = (await q.get()).docs.map(docToJSON).map((b) => ({
-      ...b,
-      label: periodLabel(b.period),
-      outstanding: b.amountDue - b.amountPaid,
-      overdue: b.status !== "paid" && toMillis(b.dueDate) < now,
-    }));
+    // Without a period: the latest three billing months.
+    const periods = period ? [period] : recentPeriods(4).slice(0, -1).reverse();
+    const nowMs = Date.now();
+    let bills = (await Promise.all(periods.map(billsFor)))
+      .flat()
+      .sort((a, b) => toMillis(b.issuedAt) - toMillis(a.issuedAt))
+      .slice(0, LIST_LIMIT)
+      .map((b) => withBillState(b, nowMs));
     if (req.query.status === "overdue") bills = bills.filter((b) => b.overdue);
     else if (req.query.status) bills = bills.filter((b) => b.status === req.query.status);
     res.json({ bills });
@@ -176,26 +184,23 @@ router.get(
 router.get(
   "/billing-runs",
   asyncHandler(async (req, res) => {
-    const snap = await collections.billingRuns().orderBy("period", "desc").limit(24).get();
-    const runs = await Promise.all(
-      snap.docs.map(async (d) => {
-        const agg = await collections.bills()
-          .where("period", "==", d.id)
-          .aggregate({ count: AggregateField.count(), billed: AggregateField.sum("amountDue"), collected: AggregateField.sum("amountPaid") })
-          .get();
-        const { count, billed, collected } = agg.data();
-        const run = docToJSON(d);
-        return {
-          ...run,
-          label: periodLabel(d.id),
-          billsGenerated: count,
-          totalBilled: billed ?? 0,
-          totalCollected: collected ?? 0,
-          status: count >= (run.metersQueued ?? 0) ? "completed" : "in_progress",
-        };
-      })
-    );
-    res.json({ runs });
+    const runs = (await query({ pk: "BILLINGRUN", desc: true, limit: 24 })).map(clean);
+    res.json({
+      runs: await Promise.all(
+        runs.map(async (run) => {
+          const bills = await billsFor(run.period);
+          return {
+            ...run,
+            id: run.period,
+            label: periodLabel(run.period),
+            billsGenerated: bills.length,
+            totalBilled: bills.reduce((s, b) => s + b.amountDue, 0),
+            totalCollected: bills.reduce((s, b) => s + b.amountPaid, 0),
+            status: bills.length >= (run.metersQueued ?? 0) ? "completed" : "in_progress",
+          };
+        })
+      ),
+    });
   })
 );
 
@@ -215,7 +220,7 @@ router.post(
 router.get(
   "/payments",
   asyncHandler(async (req, res) => {
-    let payments = (await collections.payments().orderBy("createdAt", "desc").limit(LIST_LIMIT).get()).docs.map(docToJSON);
+    let payments = await all("PAYMENTS", { desc: true, limit: LIST_LIMIT });
     if (req.query.status === "pending") payments = payments.filter((p) => !["completed", "failed"].includes(p.status));
     else if (req.query.status) payments = payments.filter((p) => p.status === req.query.status);
     res.json({ payments });
@@ -225,8 +230,8 @@ router.get(
 router.get(
   "/unmatched-payments",
   asyncHandler(async (req, res) => {
-    const snap = await collections.unmatchedMpesa().where("resolved", "==", false).limit(LIST_LIMIT).get();
-    res.json({ callbacks: snap.docs.map(docToJSON) });
+    const callbacks = await query({ pk: "UNMATCHED", filter: (c) => !c.resolved });
+    res.json({ callbacks: callbacks.map(clean) });
   })
 );
 
@@ -237,33 +242,20 @@ const TICKET_STATUSES = ["open", "in_progress", "resolved"];
 router.get(
   "/tickets",
   asyncHandler(async (req, res) => {
-    const snap = await collections.tickets().orderBy("createdAt", "desc").limit(LIST_LIMIT).get();
-    let tickets = snap.docs.map(docToJSON).map(({ attachment, ...t }) => ({
-      ...t,
-      status: t.status ?? "open",
-      attachmentName: attachment?.name ?? (typeof attachment === "string" ? "attachment" : null),
-    }));
+    let tickets = await all("TICKETS", { desc: true, limit: LIST_LIMIT });
     if (req.query.status) tickets = tickets.filter((t) => t.status === req.query.status);
     res.json({ tickets });
   })
 );
 
-// Served as a download, never inline: the content type comes from the
-// uploader, so rendering it in the admin's browser could run their HTML/JS.
+// Verified images (PNG/JPEG/GIF/WebP, checked from the bytes) can be
+// previewed; anything else is only ever a download (see lib/filetype.js).
 router.get(
   "/tickets/:id/attachment",
   asyncHandler(async (req, res) => {
-    const snap = await collections.tickets().doc(req.params.id).get();
-    const att = snap.exists ? snap.data().attachment : null;
+    const att = await get(K.ticketAttachment(req.params.id));
     if (!att) throw new HttpError(404, "No attachment");
-    const data = typeof att === "string" ? att : att.data; // older tickets stored bare base64
-    const name = (typeof att === "string" ? "attachment" : att.name).replace(/[^\w.\- ]/g, "_");
-    res.set({
-      "Content-Type": "application/octet-stream",
-      "Content-Disposition": `attachment; filename="${name}"`,
-      "X-Content-Type-Options": "nosniff",
-    });
-    res.send(Buffer.from(data, "base64"));
+    sendAttachment(res, att);
   })
 );
 
@@ -274,23 +266,22 @@ router.patch(
     if (!TICKET_STATUSES.includes(status)) throw new HttpError(400, `status must be one of ${TICKET_STATUSES.join(", ")}`);
     if (response !== undefined && String(response).length > 5000) throw new HttpError(400, "Response is too long");
 
-    const ref = collections.tickets().doc(req.params.id);
-    const snap = await ref.get();
-    if (!snap.exists) throw new HttpError(404, "Ticket not found");
-    const update = {
+    const ticket = await get(K.ticket(req.params.id));
+    if (!ticket) throw new HttpError(404, "Ticket not found");
+    const changes = {
       status,
       ...(response !== undefined ? { response: String(response).trim() || null } : {}),
       handledBy: req.user.uid,
-      updatedAt: FieldValue.serverTimestamp(),
+      updatedAt: now(),
     };
-    await ref.update(update);
+    await update(K.ticket(req.params.id), { set: changes });
 
-    const t = { ...snap.data(), ...update };
+    const t = { ...ticket, ...changes };
     if (t.uid) {
       publishAfterCommit(
         EVENTS.TICKET_UPDATED,
-        { ticketId: ref.id, uid: t.uid, subject: t.subject, status, response: t.response ?? null },
-        `ticket-updated:${ref.id}:${Date.now()}`
+        { ticketId: req.params.id, uid: t.uid, subject: t.subject, status, response: t.response ?? null },
+        `ticket-updated:${req.params.id}:${Date.now()}`
       );
     }
     res.json({ message: "Ticket updated" });
@@ -302,14 +293,15 @@ router.patch(
 router.get(
   "/connection-requests",
   asyncHandler(async (req, res) => {
-    let requests = (await collections.connectionRequests().orderBy("createdAt", "desc").limit(LIST_LIMIT).get()).docs.map(docToJSON);
-    if (req.query.status) requests = requests.filter((r) => (r.status ?? "pending").toLowerCase() === req.query.status);
+    let requests = await all("CONNREQS", { desc: true, limit: LIST_LIMIT });
+    if (req.query.status) requests = requests.filter((r) => r.status === req.query.status);
     res.json({ requests });
   })
 );
 
-// Approving installs a meter: creates meters/{meterNumber}, links it to the
-// customer and marks the request approved, all in one transaction.
+// Approving installs a meter in one transaction: the request is marked
+// approved (only if still pending), the meter is created (only if that number
+// is free) and linked to the customer.
 router.patch(
   "/connection-requests/:id",
   asyncHandler(async (req, res) => {
@@ -320,42 +312,53 @@ router.patch(
     const initialReading = Number(req.body?.initialReading ?? 0);
     if (!Number.isFinite(initialReading) || initialReading < 0) throw new HttpError(400, "Initial reading must be a non-negative number");
 
-    const reqRef = collections.connectionRequests().doc(req.params.id);
-    const meterRef = collections.meters().doc(meterNumber);
+    const id = req.params.id;
+    const request = await get(K.connectionRequest(id));
+    if (!request) throw new HttpError(404, "Request not found");
+    if (request.status !== "pending") throw new HttpError(409, `Request is already ${request.status}`);
+    if (!request.uid) throw new HttpError(409, "This request predates account linking; ask the customer to submit it again");
 
-    const request = await db.runTransaction(async (tx) => {
-      const [reqSnap, meterSnap] = await tx.getAll(reqRef, meterRef);
-      if (!reqSnap.exists) throw new HttpError(404, "Request not found");
-      const r = reqSnap.data();
-      if ((r.status ?? "pending").toLowerCase() !== "pending") throw new HttpError(409, `Request is already ${r.status}`);
-      if (!r.uid) throw new HttpError(409, "This request predates account linking; ask the customer to submit it again");
+    const review = { reviewedBy: req.user.uid, reviewedAt: now(), reviewNote: note?.trim() || null };
+    const stillPending = { condition: "#st = :pending", names: { "#st": "status" }, values: { ":pending": "pending" } };
 
-      const review = { reviewedBy: req.user.uid, reviewedAt: FieldValue.serverTimestamp(), reviewNote: note?.trim() || null };
+    try {
       if (decision === "reject") {
-        tx.update(reqRef, { status: "rejected", ...review });
-        return r;
+        await transact([tx.update(K.connectionRequest(id), { set: { status: "rejected", ...review }, ...stillPending })]);
+      } else {
+        await transact([
+          tx.update(K.connectionRequest(id), { set: { status: "approved", meterNumber, ...review }, ...stillPending }),
+          tx.put({
+            ...K.meter(meterNumber),
+            entity: "meter",
+            gsi1pk: `USER#${request.uid}`,
+            gsi1sk: `METER#${meterNumber}`,
+            gsi2pk: "METERS",
+            gsi2sk: meterNumber,
+            id: meterNumber,
+            meterNumber,
+            uid: request.uid,
+            address: request.address ?? null,
+            city: request.city ?? null,
+            status: "active",
+            initialReading,
+            lastReading: initialReading,
+            installedAt: now(),
+            connectionRequestId: id,
+          }),
+          tx.update(K.user(request.uid), { append: { meterNumbers: [meterNumber] } }),
+        ]);
       }
-      if (meterSnap.exists) throw new HttpError(409, `Meter ${meterNumber} is already in use`);
-      tx.create(meterRef, {
-        uid: r.uid,
-        address: r.address ?? null,
-        city: r.city ?? null,
-        status: "active",
-        initialReading,
-        lastReading: initialReading,
-        lastReadAt: null,
-        installedAt: FieldValue.serverTimestamp(),
-        connectionRequestId: reqRef.id,
-      });
-      tx.update(reqRef, { status: "approved", meterNumber, ...review });
-      tx.update(collections.users().doc(r.uid), { meterNumbers: FieldValue.arrayUnion(meterNumber) });
-      return r;
-    });
+    } catch (err) {
+      const [requestCheck, meterCheck] = cancellationCodes(err);
+      if (requestCheck === "ConditionalCheckFailed") throw new HttpError(409, "Request was already reviewed");
+      if (meterCheck === "ConditionalCheckFailed") throw new HttpError(409, `Meter ${meterNumber} is already in use`);
+      throw err;
+    }
 
     publishAfterCommit(
       decision === "approve" ? EVENTS.CONNECTION_APPROVED : EVENTS.CONNECTION_REJECTED,
-      { requestId: reqRef.id, uid: request.uid, address: request.address, meterNumber: decision === "approve" ? meterNumber : null, note: note?.trim() || null },
-      `connection-${decision}:${reqRef.id}`
+      { requestId: id, uid: request.uid, address: request.address, meterNumber: decision === "approve" ? meterNumber : null, note: note?.trim() || null },
+      `connection-${decision}:${id}`
     );
     res.json({ message: decision === "approve" ? `Approved, meter ${meterNumber} installed` : "Request rejected", meterNumber: decision === "approve" ? meterNumber : null });
   })

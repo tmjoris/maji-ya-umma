@@ -2,16 +2,16 @@ import express from "express";
 import multer from "multer";
 import { randomUUID } from "node:crypto";
 import { rateLimit } from "express-rate-limit";
-import { collections, FieldValue } from "../firebase.js";
+import { K, get, put, update, query, clean, now } from "../data/db.js";
 import { EVENTS } from "../mq/config.js";
 import { publishEvent, publishDelayed, BrokerUnavailableError } from "../mq/publisher.js";
+import { sendAttachment } from "../lib/filetype.js";
 import { STRIPE_ENABLED, STRIPE_PUBLISHABLE_KEY, STRIPE_CURRENCY, stripe, toStripeAmount } from "../services/stripe.js";
 import { requireAuth } from "../middleware/auth.js";
 import { loadProfile, publicProfile, fullName } from "../services/profiles.js";
 import {
   asyncHandler,
   HttpError,
-  docToJSON,
   toMillis,
   normalizeKenyanPhone,
   recentPeriods,
@@ -30,6 +30,17 @@ async function profileOf(req) {
 }
 
 const byNewest = (field) => (a, b) => toMillis(b[field]) - toMillis(a[field]);
+
+// The signed-in customer's own items of one kind (BILL#, PAYMENT#, ...),
+// newest first, from the per-customer index.
+const mine = async (uid, prefix) => (await query({ index: "gsi1", pk: `USER#${uid}`, prefix, desc: true })).map(clean);
+
+async function myPayment(req) {
+  const p = await get(K.payment(req.params.id));
+  if (!p || p.uid !== req.user.uid) throw new HttpError(404, "Payment not found");
+  return clean(p);
+}
+const setPayment = (id, fields) => update(K.payment(id), { set: { ...fields, updatedAt: now() } });
 
 // ---------- profile ----------
 
@@ -72,19 +83,15 @@ router.get(
   asyncHandler(async (req, res) => {
     const months = Math.min(Math.max(Number(req.query.months) || 6, 1), 24);
     const periods = recentPeriods(months);
-    const [usageSnap, metersSnap] = await Promise.all([
-      collections.usage().where("uid", "==", req.user.uid).get(),
-      collections.meters().where("uid", "==", req.user.uid).get(),
-    ]);
+    const [usage, meters] = await Promise.all([mine(req.user.uid, "USAGE#"), mine(req.user.uid, "METER#")]);
 
     const totals = Object.fromEntries(periods.map((p) => [p, 0]));
-    for (const d of usageSnap.docs) {
-      const u = d.data();
+    for (const u of usage) {
       if (u.period in totals) totals[u.period] += u.consumptionLitres ?? 0;
     }
 
     res.json({
-      meters: metersSnap.docs.map(docToJSON),
+      meters,
       months: periods.map((p) => ({ period: p, label: periodLabel(p), consumptionLitres: totals[p] })),
     });
   })
@@ -95,15 +102,13 @@ router.get(
 router.get(
   "/bills",
   asyncHandler(async (req, res) => {
-    const snap = await collections.bills().where("uid", "==", req.user.uid).get();
-    const now = Date.now();
-    const bills = snap.docs
-      .map(docToJSON)
+    const nowMs = Date.now();
+    const bills = (await mine(req.user.uid, "BILL#"))
       .map((b) => ({
         ...b,
         label: periodLabel(b.period),
         outstanding: b.amountDue - b.amountPaid,
-        overdue: b.status !== "paid" && toMillis(b.dueDate) < now,
+        overdue: b.status !== "paid" && toMillis(b.dueDate) < nowMs,
       }))
       .sort((a, b) => b.period.localeCompare(a.period));
     res.json({ bills });
@@ -139,17 +144,14 @@ router.get(
 router.get(
   "/payments",
   asyncHandler(async (req, res) => {
-    const snap = await collections.payments().where("uid", "==", req.user.uid).get();
-    res.json({ payments: snap.docs.map(docToJSON).sort(byNewest("createdAt")) });
+    res.json({ payments: (await mine(req.user.uid, "PAYMENT#")).sort(byNewest("createdAt")) });
   })
 );
 
 router.get(
   "/payments/:id",
   asyncHandler(async (req, res) => {
-    const snap = await collections.payments().doc(req.params.id).get();
-    if (!snap.exists || snap.data().uid !== req.user.uid) throw new HttpError(404, "Payment not found");
-    res.json({ payment: docToJSON(snap) });
+    res.json({ payment: await myPayment(req) });
   })
 );
 
@@ -177,8 +179,15 @@ router.post(
 
     const profile = await profileOf(req);
     const paymentId = randomUUID();
-    const ref = collections.payments().doc(paymentId);
-    await ref.create({
+    const createdAt = now();
+    await put({
+      ...K.payment(paymentId),
+      entity: "payment",
+      gsi1pk: `USER#${req.user.uid}`,
+      gsi1sk: `PAYMENT#${createdAt}`,
+      gsi2pk: "PAYMENTS",
+      gsi2sk: createdAt,
+      id: paymentId,
       uid: req.user.uid,
       email: profile.email,
       accountNumber: profile.accountNumber,
@@ -187,17 +196,17 @@ router.post(
       ...(phone ? { phone } : {}),
       method,
       status: "queued",
-      createdAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
+      createdAt,
+      updatedAt: createdAt,
     });
 
-    if (method === "card") return startCardPayment({ req, res, ref, paymentId, amount, profile });
+    if (method === "card") return startCardPayment({ req, res, paymentId, amount, profile });
 
     try {
       await publishEvent(EVENTS.PAYMENT_REQUESTED, { paymentId }, { id: `payment-request:${paymentId}` });
     } catch (err) {
       if (err instanceof BrokerUnavailableError) {
-        await ref.update({ status: "failed", failureReason: "Payment service unavailable", updatedAt: FieldValue.serverTimestamp() });
+        await setPayment(paymentId, { status: "failed", failureReason: "Payment service unavailable" });
       }
       throw err;
     }
@@ -206,7 +215,7 @@ router.post(
   })
 );
 
-async function startCardPayment({ req, res, ref, paymentId, amount, profile }) {
+async function startCardPayment({ req, res, paymentId, amount, profile }) {
   let intent;
   try {
     intent = await stripe().paymentIntents.create(
@@ -221,13 +230,13 @@ async function startCardPayment({ req, res, ref, paymentId, amount, profile }) {
       { idempotencyKey: `payment-${paymentId}` }
     );
   } catch (err) {
-    await ref.update({ status: "failed", failureReason: err.message, updatedAt: FieldValue.serverTimestamp() });
+    await setPayment(paymentId, { status: "failed", failureReason: err.message });
     // e.g. amount below Stripe's minimum: tell the customer why.
     if (err.type === "StripeInvalidRequestError") throw new HttpError(400, err.message);
     throw err;
   }
 
-  await ref.update({ status: "pending", stripePaymentIntentId: intent.id, updatedAt: FieldValue.serverTimestamp() });
+  await setPayment(paymentId, { status: "pending", stripePaymentIntentId: intent.id });
 
   // Safety net if the webhook never arrives. Not fatal if the broker is down:
   // the webhook alone settles the payment.
@@ -254,10 +263,7 @@ router.post(
   "/payments/:id/confirm",
   confirmLimiter,
   asyncHandler(async (req, res) => {
-    const ref = collections.payments().doc(req.params.id);
-    const snap = await ref.get();
-    if (!snap.exists || snap.data().uid !== req.user.uid) throw new HttpError(404, "Payment not found");
-    const p = snap.data();
+    const p = await myPayment(req);
     if (p.method !== "card") throw new HttpError(400, "Only card payments are confirmed this way");
     if (["completed", "failed"].includes(p.status) || !p.stripePaymentIntentId) return res.json({ status: p.status });
 
@@ -268,10 +274,10 @@ router.post(
         {
           type: intent.status === "succeeded" ? "payment_intent.succeeded" : "payment_intent.canceled",
           paymentIntentId: intent.id,
-          paymentId: ref.id,
+          paymentId: p.id,
           source: "client_return",
         },
-        { id: `stripe:confirm:${ref.id}:${intent.status}` }
+        { id: `stripe:confirm:${p.id}:${intent.status}` }
       );
     }
     res.json({ status: p.status, stripeStatus: intent.status });
@@ -283,10 +289,7 @@ router.post(
 router.post(
   "/payments/:id/cancel",
   asyncHandler(async (req, res) => {
-    const ref = collections.payments().doc(req.params.id);
-    const snap = await ref.get();
-    if (!snap.exists || snap.data().uid !== req.user.uid) throw new HttpError(404, "Payment not found");
-    const p = snap.data();
+    const p = await myPayment(req);
     if (p.method !== "card") throw new HttpError(400, "Only card payments can be cancelled");
     if (["completed", "failed"].includes(p.status)) throw new HttpError(409, `Payment is already ${p.status}`);
 
@@ -298,8 +301,8 @@ router.post(
     }
     await publishEvent(
       EVENTS.STRIPE_EVENT_RECEIVED,
-      { type: "payment_intent.canceled", paymentIntentId: p.stripePaymentIntentId, paymentId: ref.id, source: "customer" },
-      { id: `stripe:cancel:${ref.id}` }
+      { type: "payment_intent.canceled", paymentIntentId: p.stripePaymentIntentId, paymentId: p.id, source: "customer" },
+      { id: `stripe:cancel:${p.id}` }
     );
     res.json({ message: "Payment cancelled" });
   })
@@ -310,28 +313,36 @@ router.post(
 const CATEGORIES = ["billing", "technical", "account", "service", "other"];
 const PRIORITIES = ["low", "medium", "high"];
 
-// Attachments are stored base64-encoded inside the Firestore document, which
-// is capped at 1 MiB.
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 700 * 1024, files: 1 } }).single("attachment");
+// Attachments are stored in DynamoDB, whose items are capped at 400 KB.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 350 * 1024, files: 1 } }).single("attachment");
 const parseUpload = (req, res, next) =>
   upload(req, res, (err) => {
     if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
-      return res.status(413).json({ message: "Attachment must be 700 KB or smaller" });
+      return res.status(413).json({ message: "Attachment must be 350 KB or smaller" });
     }
     if (err) return res.status(400).json({ message: "Invalid upload" });
     next();
   });
 
-const ticketSummary = (t) => {
-  const { attachment, ...rest } = t;
-  return { ...rest, attachmentName: attachment?.name ?? null };
-};
+// The file itself is a separate item (see workers/records.js); lists only show its name.
+const ticketSummary = (t) => ({ ...t, attachmentName: t.attachmentName ?? null });
 
 router.get(
   "/tickets",
   asyncHandler(async (req, res) => {
-    const snap = await collections.tickets().where("uid", "==", req.user.uid).get();
-    res.json({ tickets: snap.docs.map(docToJSON).map(ticketSummary).sort(byNewest("createdAt")) });
+    res.json({ tickets: (await mine(req.user.uid, "TICKET#")).map(ticketSummary) });
+  })
+);
+
+// A customer can fetch the attachment on their own tickets only.
+router.get(
+  "/tickets/:id/attachment",
+  asyncHandler(async (req, res) => {
+    const ticket = await get(K.ticket(req.params.id));
+    if (!ticket || ticket.uid !== req.user.uid) throw new HttpError(404, "Ticket not found");
+    const att = await get(K.ticketAttachment(req.params.id));
+    if (!att) throw new HttpError(404, "No attachment");
+    sendAttachment(res, att);
   })
 );
 
@@ -368,8 +379,7 @@ router.post(
 router.get(
   "/connection-requests",
   asyncHandler(async (req, res) => {
-    const snap = await collections.connectionRequests().where("uid", "==", req.user.uid).get();
-    res.json({ requests: snap.docs.map(docToJSON).sort(byNewest("createdAt")) });
+    res.json({ requests: await mine(req.user.uid, "CONNREQ#") });
   })
 );
 
@@ -377,8 +387,8 @@ router.post(
   "/connection-requests",
   asyncHandler(async (req, res) => {
     const profile = await profileOf(req);
-    const existing = await collections.connectionRequests().where("uid", "==", req.user.uid).get();
-    if (existing.docs.some((d) => d.data().status === "pending")) {
+    const existing = await mine(req.user.uid, "CONNREQ#");
+    if (existing.some((r) => r.status === "pending")) {
       throw new HttpError(409, "You already have a connection request waiting for review");
     }
 

@@ -1,9 +1,10 @@
 import express from "express";
 import { rateLimit } from "express-rate-limit";
-import { auth, collections, FieldValue } from "../firebase.js";
+import { auth } from "../firebase.js";
+import { putIfAbsent, now } from "../data/db.js";
 import { EVENTS } from "../mq/config.js";
 import { publishEvent } from "../mq/publisher.js";
-import { ROLES } from "../services/profiles.js";
+import { ROLES, newUserItem } from "../services/profiles.js";
 import { asyncHandler, HttpError, normalizeKenyanPhone, generateAccountNumber } from "../lib/util.js";
 
 const router = express.Router();
@@ -65,13 +66,11 @@ router.post(
       zipCode: String(body.zipCode ?? "").trim(),
       userRole: ROLES.CUSTOMER,
       accountNumber: generateAccountNumber(),
-      balance: 0,
-      meterNumbers: [],
-      createdOn: FieldValue.serverTimestamp(),
+      createdOn: now(),
     };
 
     try {
-      await collections.users().doc(user.uid).set(profile);
+      if (!(await putIfAbsent(newUserItem(profile)))) throw new Error(`profile for ${user.uid} already exists`);
     } catch (err) {
       await auth.deleteUser(user.uid).catch(() => {}); // don't leave a login without a profile
       throw err;

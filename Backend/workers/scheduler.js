@@ -1,5 +1,5 @@
 import "../env.js";
-import { collections } from "../firebase.js";
+import { K, get } from "../data/db.js";
 import { EVENTS } from "../mq/config.js";
 import { publishEvent } from "../mq/publisher.js";
 import { periodOf, periodStart, shiftPeriod } from "../lib/util.js";
@@ -22,7 +22,7 @@ export function startBillingScheduler() {
       const current = periodOf(new Date());
       const previous = shiftPeriod(current, -1);
       if (Date.now() - periodStart(current).getTime() < GRACE_HOURS * 3_600_000) return;
-      if ((await collections.billingRuns().doc(previous).get()).exists) return;
+      if (await get(K.billingRun(previous))) return;
 
       await publishEvent(
         EVENTS.BILLING_RUN_REQUESTED,
