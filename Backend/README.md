@@ -1,15 +1,16 @@
 # Backend
 
-Express API plus RabbitMQ workers for Maji ya Umma. Works with a local RabbitMQ
-or **Amazon MQ for RabbitMQ**; only `AMQP_URL` changes. Customers pay with
-**M-Pesa** (Daraja STK Push) or **card** (Stripe).
+Express API plus RabbitMQ workers for Maji ya Umma, on AWS: data in
+**Amazon DynamoDB**, messaging on **Amazon MQ for RabbitMQ** (or a local
+RabbitMQ; only `AMQP_URL` changes), sign-in with **Firebase Auth**. Customers
+pay with **M-Pesa** (Daraja STK Push) or **card** (Stripe).
 
 ## How it fits together
 
 ```
 browser ── Firebase Auth (sign-in only) ──▶ ID token
    │
-   └─ HTTPS + Bearer token ─▶ API (server.js) ─── reads ───────────────▶ Firestore (Admin SDK)
+   └─ HTTPS + Bearer token ─▶ API (server.js) ─── reads ───────────────▶ DynamoDB (one table)
                                  │                                         ▲
 meter gateways ─ X-Api-Key ─▶    │ publish                                 │ writes
 Daraja / Stripe ─ callbacks ─▶   ▼                                         │
@@ -58,11 +59,12 @@ query, Stripe API) before settling, and credits the amount *we* asked to charge.
 Someone who could post to the callback URL or write to RabbitMQ still can't
 fake a payment. Covered by `npm run test:mpesa` and the card part of `npm run test:e2e`.
 
-- The browser only talks to Firebase **Auth**. Firestore is closed to browsers
-  (`firestore.rules`); the backend uses the Admin SDK with a service account.
+- The browser only uses Firebase **Auth** to sign in. All data is in DynamoDB,
+  reachable only by the backend's IAM user, which can read and write that one
+  table and nothing else (`infra/data.yaml`).
 - Every `/api/me/*` route acts on the user from the verified ID token, never
   on an email or id sent by the client.
-- Admin routes check `userRole == "admin"` in Firestore on every request, so
+- Admin routes check `userRole == "admin"` in DynamoDB on every request, so
   revoking a role takes effect immediately.
 - Stripe webhooks are signature-checked (HMAC + timestamp). The M-Pesa
   callback URL carries a secret token (Daraja doesn't sign callbacks), and
@@ -79,11 +81,14 @@ fake a payment. Covered by `npm run test:mpesa` and the card part of `npm run te
 
 ```bash
 # repo root: RabbitMQ (management UI http://localhost:15672, guest/guest)
-docker compose up -d rabbitmq
+# and DynamoDB Local (http://localhost:8000)
+docker compose up -d rabbitmq dynamodb
 
 cd Backend
 npm install
-cp .env.example .env      # set FIREBASE_SERVICE_ACCOUNT_FILE + METER_INGEST_API_KEY
+cp .env.example .env      # set FIREBASE_SERVICE_ACCOUNT_FILE + METER_INGEST_API_KEY,
+                          # and DYNAMODB_ENDPOINT=http://localhost:8000 for local data
+npm run db:create         # creates the table in DynamoDB Local (once)
 npm start                 # API on :5000
 npm run worker            # all consumers + billing scheduler
 
@@ -127,21 +132,49 @@ Content-Type: application/json
 `reading` is the cumulative dial value in m³. Up to 500 per request. Re-sending
 the same reading (same meter and timestamp) is harmless.
 
-## Moving the live project over
+## Running on AWS (eu-west-1)
 
-1. **Service account:** Firebase console → Project settings → Service accounts →
-   *Generate new private key*; set `FIREBASE_SERVICE_ACCOUNT_FILE`. Keep the
-   file out of git (`.gitignore` already covers `*service-account*.json`).
-2. **Deploy rules and indexes** (from the repo root), *after* the new backend
-   is live, because the old code needs open rules:
-   `npx firebase-tools deploy --only firestore --project maji-ya-umma`
-3. **Purge stored card data.** The old payment form saved card numbers and
-   CVVs in plain text:
-   `npm run purge-card-data` (dry run), then `npm run purge-card-data -- --apply`.
-4. **Existing users** need nothing: each profile moves to `user/<uid>` on that
-   user's first sign-in and gets an account number. Old tickets and connection
-   requests have no `uid`, so they appear for admins but not in customers' lists.
-5. **Firebase API key**: the web key in git history is public by design, but
+Two CloudFormation stacks, managed by scripts in `infra/` (run from the repo root,
+signed in with `aws login`):
+
+| Stack | What | Cost |
+|---|---|---|
+| `maji-ya-umma-data` (`infra/data.yaml`) | DynamoDB table (8 RCU/WCU each for table + 2 indexes = 24/24, inside the always-free 25/25), the backend's IAM user (this table only), the broker auto-delete role | $0 at this size |
+| `maji-ya-umma-mq` (`infra/mq.yaml`) | Amazon MQ RabbitMQ broker, `mq.m7g.medium` (the smallest RabbitMQ size; `mq.t3.micro` is ActiveMQ-only), public over TLS only | **about $0.15/hour while it exists, used or not** |
+
+```bash
+infra/data.sh deploy          # table + IAM; points Backend/.env at the table
+infra/data.sh keys            # access key for the backend user → Backend/.env (never printed)
+
+infra/mq.sh up 3              # broker for ~3 hours (15-20 min to create); updates AMQP_URL in Backend/.env
+infra/mq.sh status            # running? since when, cost so far, deletion time
+infra/mq.sh extend 2          # keep it 2 more hours from now
+infra/mq.sh down              # delete it now (AMQP_URL goes back to local RabbitMQ)
+infra/mq.sh url               # AMQP_URL for Render (contains the broker password)
+```
+
+Every broker deletes itself at its deletion time (an EventBridge Scheduler
+one-time schedule), so a forgotten broker costs at most a few hours. While no
+broker exists the site still serves sign-in, bills, usage and history from
+DynamoDB, but anything queued (payments, readings, profile edits, tickets,
+connection requests) answers "try again shortly" (503). Each new broker has a new
+address, so after `up`, paste `infra/mq.sh url` into Render's `AMQP_URL`.
+
+On Render, set `AWS_REGION=eu-west-1`, `DYNAMODB_TABLE=maji-ya-umma`,
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (from `Backend/.env` after
+`infra/data.sh keys`), plus the Firebase service account and `AMQP_URL`.
+
+## Moving the live data over
+
+1. **Copy Firestore into DynamoDB** (Firestore is only read):
+   `npm run migrate-firestore` (dry run), then `npm run migrate-firestore -- --apply`.
+   Profiles are re-keyed by their Firebase Auth uid; connection requests and
+   tickets are copied (attachments up to 350 KB). The old payment records are
+   not copied: the old form saved them without any money moving.
+2. **Lock Firestore** once nothing uses it (from the repo root):
+   `npx firebase-tools deploy --only firestore:rules --project maji-ya-umma`.
+   `firestore.rules` denies all access; the old data stays as a backup.
+3. **Firebase API key**: the web key in git history is public by design, but
    consider restricting it to your domains in Google Cloud console → Credentials.
 
 ### M-Pesa (Daraja)
@@ -174,15 +207,11 @@ are rejected with Stripe's message. If you'd rather not expose a webhook
 endpoint at all, Stripe can deliver events to Amazon EventBridge instead,
 which would need a small bridge into RabbitMQ.
 
-### Amazon MQ
+### Amazon MQ notes
 
-1. Create an Amazon MQ → RabbitMQ broker (cluster deployment for production)
-   and a broker user (`guest` doesn't exist there).
-2. `AMQP_URL=amqps://<user>:<password>@<broker-endpoint>:5671` (URL-encode the
-   password) and `MQ_QUEUE_TYPE=quorum`.
-3. Allow the API/worker hosts to reach port 5671.
-
-The API and worker declare all exchanges and queues on startup.
+The API and worker declare all exchanges and queues on startup, so a fresh
+broker needs no setup. For an always-on production broker, use a cluster
+deployment and `MQ_QUEUE_TYPE=quorum` instead of the on-demand single instance.
 
 ## Scaling
 
@@ -211,16 +240,18 @@ arguments (`PRECONDITION_FAILED`). Drain and delete the affected queues
 above in 23 checks (about a minute; the card checks use a local fake Stripe,
 `test/fake-stripe.js`). `npm run test:mpesa` (4 checks) shows that forged or wrong
 M-Pesa callbacks can't settle payments (against `test/fake-daraja.js`).
-Both run only against the Firebase emulators, and `test:e2e` wipes them first:
+Both run only against DynamoDB Local and the Firebase Auth emulator, never AWS,
+and `test:e2e` wipes them first:
 
 ```bash
 # terminal 1 (repo root)
-npx firebase-tools emulators:start --only auth,firestore --project demo-maji
+npx firebase-tools emulators:start --only auth --project demo-maji
 # terminal 2 (repo root). Fresh broker: the shorter retry delay below is a
 # queue argument and conflicts with queues declared with the default.
-docker compose down -v && docker compose up -d rabbitmq
+docker compose down -v && docker compose up -d rabbitmq dynamodb
 cd Backend
-export FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099 \
+export DYNAMODB_ENDPOINT=http://localhost:8000 DYNAMODB_TABLE=maji-ya-umma-test \
+       FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099 \
        FIREBASE_PROJECT_ID=demo-maji METER_INGEST_API_KEY=test-meter-key \
        MPESA_CALLBACK_TOKEN=test-callback-token MQ_RETRY_DELAY_MS=2000 \
        MPESA_SIMULATED_CALLBACK_DELAY_MS=2000 MPESA_STATUS_CHECK_DELAY_MS=8000 \
