@@ -9,9 +9,11 @@
     "worker:prod": "node worker.js",
     "set-role": "node scripts/set-role.js",
     "simulate-readings": "node scripts/simulate-readings.js",
-    "purge-card-data": "node scripts/purge-card-data.js",
     "test:e2e": "node test/e2e.js",
-    "test:mpesa": "node test/mpesa-verify.js"
+    "test:mpesa": "node test/mpesa-verify.js",
+    "db:create": "node scripts/create-table.js",
+    "migrate-firestore": "node scripts/migrate-from-firestore.js",
+    "fix-attachments": "node scripts/fix-attachment-types.js"
   },
   "keywords": [],
   "author": "",
@@ -19,6 +21,8 @@
   "description": "",
   "type": "module",
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1169.0",
+    "@aws-sdk/lib-dynamodb": "^3.1169.0",
     "amqplib": "^0.10.9",
     "cors": "^2.8.5",
     "express": "^4.21.2",

@@ -21,5 +21,18 @@ services:
       timeout: 5s
       retries: 5
 
+  # Local stand-in for Amazon DynamoDB (development and tests).
+  # Create the table once: cd Backend && npm run db:create
+  dynamodb:
+    image: amazon/dynamodb-local:2.6.1
+    container_name: maji-dynamodb
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-dbPath", "/home/dynamodblocal/data"]
+    user: root
+    ports:
+      - "8000:8000"
+    volumes:
+      - dynamodb-data:/home/dynamodblocal/data
+
 volumes:
   rabbitmq-data:
+  dynamodb-data:

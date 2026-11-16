@@ -1,5 +1,4 @@
 import { randomInt, timingSafeEqual, createHash } from "node:crypto";
-import { Timestamp } from "firebase-admin/firestore";
 
 // ---------- HTTP helpers ----------
 
@@ -21,9 +20,8 @@ export function safeEqual(a, b) {
   return timingSafeEqual(ha, hb);
 }
 
-// Firestore Timestamps -> ISO strings, recursively, for JSON responses.
+// Dates -> ISO strings, recursively, for JSON responses.
 export function serialize(value) {
-  if (value instanceof Timestamp) return value.toDate().toISOString();
   if (value instanceof Date) return value.toISOString();
   if (Array.isArray(value)) return value.map(serialize);
   if (value && typeof value === "object") {
@@ -32,10 +30,7 @@ export function serialize(value) {
   return value;
 }
 
-export const docToJSON = (doc) => serialize({ id: doc.id, ...doc.data() });
-
-export const toMillis = (v) =>
-  v instanceof Timestamp ? v.toMillis() : v instanceof Date ? v.getTime() : v ? Date.parse(v) : 0;
+export const toMillis = (v) => (v instanceof Date ? v.getTime() : typeof v === "number" ? v : v ? Date.parse(v) : 0);
 
 // ---------- Kenya-specific ----------
 
