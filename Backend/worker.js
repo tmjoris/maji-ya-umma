@@ -45,12 +45,21 @@ if (selected.includes("paymentsInitiate") || selected.includes("paymentsStatusCh
 }
 assertStripeConfig();
 
+// One channel per consumer: Amazon MQ allows at most 10 consumers per
+// channel, and a channel error then only affects its own queue. If any
+// consumer channel closes, the whole connection is rebuilt so it comes back.
+let stopping = false;
 const broker = createBroker({
   name: `maji-worker[${selected.join(",")}]`,
-  onReady: async (channel) => {
+  onReady: async (_channel, connection) => {
     for (const key of selected) {
       const { name, prefetch } = QUEUES[key];
-      await consume(channel, name, HANDLERS[key], { prefetch });
+      const ch = await connection.createConfirmChannel();
+      ch.on("error", (err) => console.error(`[worker:${name}] channel error: ${err.message}`));
+      ch.on("close", () => {
+        if (!stopping) connection.close().catch(() => {});
+      });
+      await consume(ch, name, HANDLERS[key], { prefetch });
     }
   },
 });
@@ -60,6 +69,7 @@ await Promise.all([broker.start(), publisher.start()]);
 if (selected.includes("billingRuns")) startBillingScheduler();
 
 const shutdown = async (signal) => {
+  stopping = true;
   console.log(`[worker] ${signal} received, closing broker connections`);
   await Promise.all([broker.close(), publisher.close()]);
   process.exit(0);

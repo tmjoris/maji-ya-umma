@@ -5,8 +5,8 @@ import { assertTopology } from "./topology.js";
 const redact = (url) => url.replace(/\/\/([^:@/]+):([^@/]+)@/, "//$1:***@");
 
 // Owns one AMQP connection + confirm channel and keeps it alive.
-// `onReady(channel)` runs after every (re)connect — workers use it to
-// re-register their consumers.
+// `onReady(channel, connection)` runs after every (re)connect — workers use it
+// to re-register their consumers.
 export function createBroker({ name, onReady } = {}) {
   let connection = null;
   let channel = null;
@@ -42,7 +42,7 @@ export function createBroker({ name, onReady } = {}) {
       });
 
       await assertTopology(ch);
-      if (onReady) await onReady(ch);
+      if (onReady) await onReady(ch, conn);
 
       connection = conn;
       channel = ch;
