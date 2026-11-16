@@ -3,8 +3,9 @@
 //
 //   npm run set-role -- someone@example.com admin
 //   npm run set-role -- someone@example.com user
-import { auth, collections } from "../firebase.js";
-import { loadProfile, ROLES } from "../services/profiles.js";
+import { auth } from "../firebase.js";
+import { K, get, update, putIfAbsent, now } from "../data/db.js";
+import { ROLES, newUserItem } from "../services/profiles.js";
 
 const [email, role] = process.argv.slice(2);
 if (!email || ![ROLES.ADMIN, ROLES.CUSTOMER].includes(role)) {
@@ -14,12 +15,10 @@ if (!email || ![ROLES.ADMIN, ROLES.CUSTOMER].includes(role)) {
 
 try {
   const user = await auth.getUserByEmail(email);
-  const profile = await loadProfile({ uid: user.uid, email: user.email }); // migrates legacy profiles
-  const ref = collections.users().doc(user.uid);
-  if (profile) {
-    await ref.update({ userRole: role });
+  if (await get(K.user(user.uid))) {
+    await update(K.user(user.uid), { set: { userRole: role } });
   } else {
-    await ref.set({ uid: user.uid, email: user.email, firstName: user.displayName ?? "", userRole: role, balance: 0, meterNumbers: [] });
+    await putIfAbsent(newUserItem({ uid: user.uid, email: user.email, firstName: user.displayName ?? "", userRole: role, createdOn: now() }));
   }
   console.log(`${email} is now ${role}`);
   process.exit(0);
