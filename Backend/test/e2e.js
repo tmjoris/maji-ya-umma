@@ -1,13 +1,13 @@
-// End-to-end test of the whole backend: API → RabbitMQ → workers → Firestore.
+// End-to-end test of the whole backend: API → RabbitMQ → workers → DynamoDB.
 //
-// Runs ONLY against the Firebase emulators (it wipes them first). Setup is in
-// Backend/README.md under "Testing".
+// Runs ONLY against DynamoDB Local and the Firebase Auth emulator (it wipes
+// both first). Setup is in Backend/README.md under "Testing".
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import "../env.js";
 
-if (!process.env.FIRESTORE_EMULATOR_HOST || !process.env.FIREBASE_AUTH_EMULATOR_HOST) {
-  console.error("Refusing to run: FIRESTORE_EMULATOR_HOST and FIREBASE_AUTH_EMULATOR_HOST must point at the emulators.");
+if (!process.env.DYNAMODB_ENDPOINT || !process.env.FIREBASE_AUTH_EMULATOR_HOST) {
+  console.error("Refusing to run: DYNAMODB_ENDPOINT (DynamoDB Local) and FIREBASE_AUTH_EMULATOR_HOST must be set.");
   process.exit(1);
 }
 
@@ -17,11 +17,12 @@ const AUTH = `http://${process.env.FIREBASE_AUTH_EMULATOR_HOST}/identitytoolkit.
 const BACKEND = fileURLToPath(new URL("..", import.meta.url));
 const METER_KEY = process.env.METER_INGEST_API_KEY;
 const CALLBACK_TOKEN = process.env.MPESA_CALLBACK_TOKEN;
-const { collections, auth: adminAuth, Timestamp } = await import("../firebase.js");
+const { auth: adminAuth } = await import("../firebase.js");
+const { K, get, update, query } = await import("../data/db.js");
 const { periodOf, periodStart, shiftPeriod } = await import("../lib/util.js");
 
-// Start from empty emulators.
-await fetch(`http://${process.env.FIRESTORE_EMULATOR_HOST}/emulator/v1/projects/${PROJECT}/databases/(default)/documents`, { method: "DELETE" });
+// Start from an empty local table and no emulator accounts.
+execSync("npm run -s db:create -- --reset", { cwd: BACKEND, env: process.env, stdio: "pipe" });
 await fetch(`http://${process.env.FIREBASE_AUTH_EMULATOR_HOST}/emulator/v1/projects/${PROJECT}/accounts`, { method: "DELETE" });
 
 // Dates relative to today: last month gets 4.5 m³, this month 5.5 m³.
@@ -106,7 +107,7 @@ check("meter API rejects a wrong key", r.status === 401);
 
 // Install backdated so last month can be billed. 100 → 104.5 m³ last month,
 // → 110 this month; sent newest first, one by one, then resent as a batch.
-await collections.meters().doc(meterNumber).update({ installedAt: Timestamp.fromMillis(periodStart(PREV).getTime() - 24 * HOUR) });
+await update(K.meter(meterNumber), { set: { installedAt: new Date(periodStart(PREV).getTime() - 24 * HOUR).toISOString() } });
 const series = [[T.prev1, 100.0], [T.prev15, 102.0], [T.prev28, 104.5], [T.cur, 110.0]].map(([readAt, reading]) => ({ meterNumber, reading, readAt }));
 for (const one of [...series].reverse()) {
   await call("POST", "/api/readings", { headers: { "X-Api-Key": METER_KEY }, body: one });
@@ -159,26 +160,33 @@ const ticket = await until(async () => (await call("GET", "/api/me/tickets", { t
 const download = await call("GET", `/api/admin/tickets/${ticket.id}/attachment`, { token: at });
 await call("PATCH", `/api/admin/tickets/${ticket.id}`, { token: at, body: { status: "resolved", response: "Valve adjusted." } });
 r = await call("GET", "/api/me/tickets", { token: ct });
-check("ticket answered by admin; attachment only served as a download",
-  r.data.tickets[0].response === "Valve adjusted." && download.headers.get("content-type") === "application/octet-stream");
+check("ticket answered by admin; uploaded HTML only ever served as a sandboxed download",
+  r.data.tickets[0].response === "Valve adjusted." && download.headers.get("content-type") === "application/octet-stream" &&
+  /sandbox/.test(download.headers.get("content-security-policy") ?? ""));
+
+// A 1x1 PNG uploaded with no extension and a generic type: detected from its bytes.
+const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+const photoForm = new FormData();
+photoForm.set("subject", "Broken pipe photo"); photoForm.set("category", "technical"); photoForm.set("priority", "medium"); photoForm.set("message", "See photo.");
+photoForm.set("attachment", new Blob([png], { type: "application/octet-stream" }), "photo");
+await call("POST", "/api/me/tickets", { token: ct, form: photoForm });
+const photoTicket = await until(async () => (await call("GET", "/api/me/tickets", { token: ct })).data.tickets?.find((t) => t.subject === "Broken pipe photo"));
+const ownCopy = await call("GET", `/api/me/tickets/${photoTicket?.id}/attachment`, { token: ct });
+const someoneElse = await call("GET", `/api/me/tickets/${photoTicket?.id}/attachment`, { token: at });
+check("image detected from its bytes: previewable by its owner, 404 for anyone else",
+  photoTicket?.attachmentIsImage === true && photoTicket.attachmentName === "photo.png" &&
+  ownCopy.headers.get("content-type") === "image/png" && someoneElse.status === 404);
 
 // ---------- leak alert, legacy users, queues ----------
 await call("POST", "/api/readings", { headers: { "X-Api-Key": METER_KEY }, body: { meterNumber, reading: 130, readAt: T.leak } });
 
-const legacyEmail = `legacy${suffix}@test.local`;
-await adminAuth.createUser({ email: legacyEmail, password: "legacy-pass-1" });
-await collections.users().add({ email: legacyEmail, firstName: "Old", userRole: "user" });
-r = await call("GET", "/api/me", { token: await signIn(legacyEmail, "legacy-pass-1") });
-const legacyDocs = await collections.users().where("email", "==", legacyEmail).get();
-check("pre-existing profile migrated on first sign-in", r.data.user?.firstName === "Old" && legacyDocs.size === 1 && legacyDocs.docs[0].id === r.data.user.uid);
-
 r = await call("GET", "/api/admin/queues", { token: at });
 check("admin queue stats show the dead-lettered reading", r.data.queues?.find((q) => q.key === "readings")?.deadLettered >= 1);
 
-const parked = await until(async () => (await collections.unmatchedMpesa().doc(`ws_CO_unknown_${suffix}`).get()).exists, 90000);
+const parked = await until(async () => Boolean(await get(K.unmatched(`ws_CO_unknown_${suffix}`))), 90000);
 check("M-Pesa callback: wrong token 404, unknown checkout parked for review", wrongToken === 404 && Boolean(parked));
 
-const notes = async () => (await collections.notifications().where("uid", "==", customerUid).get()).docs.map((d) => d.data());
+const notes = () => query({ index: "gsi1", pk: `USER#${customerUid}`, prefix: "NOTIFICATION#" });
 const kinds = (await notes()).map((n) => `${n.channel}:${n.sourceEvent}`);
 const count = (k) => kinds.filter((x) => x === k).length;
 check("notifications sent once each (bill SMS once despite re-run, leak alert sent)",

@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { Download, Search } from "lucide-react"
+import { Search } from "lucide-react"
 import { toast } from "react-toastify"
 
 import { Button } from "../../components/ui/button"
@@ -12,19 +12,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 import { AdminLayout } from "../../Components/admin-layout"
 import { DataTable, matches } from "../../Components/data-table"
 import { StatusBadge, ErrorNote } from "../../Components/status-badge"
+import { TicketAttachment } from "../../Components/ticket-attachment"
 import { api, useApi } from "../../lib/api"
 import { formatDate, formatDateTime, fullName, displayPhone } from "../../lib/format"
-
-async function downloadAttachment(ticket) {
-  try {
-    const res = await api(`/api/admin/tickets/${ticket.id}/attachment`, { raw: true })
-    const url = URL.createObjectURL(await res.blob())
-    Object.assign(document.createElement("a"), { href: url, download: ticket.attachmentName || "attachment" }).click()
-    URL.revokeObjectURL(url)
-  } catch (err) {
-    toast.error(err.message)
-  }
-}
 
 function TicketDetail({ ticket, onSaved, onClose }) {
   const [status, setStatus] = useState(ticket.status)
@@ -54,11 +44,7 @@ function TicketDetail({ ticket, onSaved, onClose }) {
       </CardHeader>
       <CardContent className="space-y-4">
         <p className="whitespace-pre-wrap rounded bg-muted p-3 text-sm">{ticket.message}</p>
-        {ticket.attachmentName && (
-          <Button variant="outline" size="sm" onClick={() => downloadAttachment(ticket)}>
-            <Download className="mr-1 h-4 w-4" /> {ticket.attachmentName}
-          </Button>
-        )}
+        <TicketAttachment ticket={ticket} endpoint={`/api/admin/tickets/${ticket.id}/attachment`} />
         <div className="grid gap-4 md:grid-cols-[200px_1fr]">
           <div className="grid gap-2">
             <Label>Status</Label>

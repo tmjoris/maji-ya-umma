@@ -8,6 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 import { Button } from "../../components/ui/button";
 import { toast } from "react-toastify";
 import { StatusBadge, Empty } from "../../Components/status-badge";
+import { TicketAttachment } from "../../Components/ticket-attachment";
 import { api, useApi } from "../../lib/api";
 import { formatDate } from "./shared";
 
@@ -128,7 +129,7 @@ function FeedbackPage() {
                 </div>
 
                 <div className="grid gap-2">
-                  <Label htmlFor="attachment">Attachment (optional, max 700 KB)</Label>
+                  <Label htmlFor="attachment">Attachment (optional, max 350 KB)</Label>
                   <Input
                     id="attachment"
                     type="file"
@@ -161,6 +162,11 @@ function FeedbackPage() {
                       <StatusBadge status={t.status} />
                     </div>
                     <p className="text-xs text-muted-foreground">{formatDate(t.createdAt)} · {t.category} · {t.priority} priority</p>
+                    {t.attachmentName && (
+                      <div className="mt-2">
+                        <TicketAttachment ticket={t} endpoint={`/api/me/tickets/${t.id}/attachment`} compact />
+                      </div>
+                    )}
                     {t.response && <p className="mt-2 rounded bg-muted p-2 text-sm"><span className="font-medium">Reply:</span> {t.response}</p>}
                   </div>
                 ))}
